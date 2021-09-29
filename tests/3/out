@@ -1,0 +1,6 @@
+# test missing context after the hunk for adding a line
+A
+B
+C
+D
+DD

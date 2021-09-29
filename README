@@ -1,0 +1,61 @@
+mpatch maintainer:
+Chris Mason <chris.mason@oracle.com>
+http://oss.oracle.com/~mason/mpatch
+
+mpatch applies diffs and is generally similar to patch, but it can help resolve
+a number of common causes of patch rejects.
+
+By default, it applies diffs with the same offset and fuzz rules that patch
+uses, and mpatch is intended to be as safe as patch for normal usage.  I'm
+very interested in any bug reports where mpatch does something unexpected.
+
+When run with -a, it will merge the rejects back into the original file and
+open a merge program (gvimdiff by default) to help you review the changes.
+
+mpatch also supports the git patch extensions.  Outside of an SCM, these
+are mostly useful to preserve permissions changes in a patch.
+
+Reject merging works by using the entire hunk as a source of context, and
+being more relaxed about finding extra lines in the source file, or not
+finding every line from the hunk.
+
+If the hunk tries to delete a line that is not present in the file,
+mpatch will put a deletion marker into the merged result so you can
+fix things up.
+
+Reject files are always created in the patch style, allowing you to verify
+the result of the merge.  Rejects created by mpatch are unified diffs,
+and have a simple patch header.
+
+vimdiff users may want to look at the macros in vimrc.  These make it easy
+to copy conflict sections from one vimdiff window to another.
+
+quilt users will want to look at cmd/qp (this is not installed by default).
+It is a helper script to parse the output from quilt push looking for fuzz
+and rejects, and it provides a prompt that will run mpatch for you.
+
+Mercurial users will want to look at cmd/mp (this is not installed by default).
+It is a helper script to parse the output from hg qpush looking for fuzz
+and rejects, and it provides a prompt that will run mpatch for you.
+
+Sample usage:
+    Apply diff and auto merge any rejects found
+    mpatch -a < diff
+
+    Auto merge the reject hunks from file.rej into file
+    (file.rej is automatically tried if not provided on the command line)
+    mpatch -a file [file.rej]
+
+    Auto merge diff into file (useful when diff doesn't have headers)
+    mpatch -a file diff
+
+    Auto merge diff into file, but store the results in 'otherfile'
+    mpatch -o otherfile file diff
+
+Other merge programs are allowed:
+    mpatch -a -m kdiff3 < diff
+
+    You can use any program that can accept two file names on the command
+    line.
+
+Other options are documented in mpatch -h

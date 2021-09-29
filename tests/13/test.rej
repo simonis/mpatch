@@ -1,0 +1,13 @@
+--- test
++++ test
+@@ -112,8 +112,8 @@ extern struct group_info init_groups;
+ 	.proc_lock	= SPIN_LOCK_UNLOCKED,				\
+ 	.switch_lock	= SPIN_LOCK_UNLOCKED,				\
+ 	.journal_info	= NULL,						\
++	.private_pages	= LIST_HEAD_INIT(tsk.private_pages),		\
++	.private_pages_count = 0,					\
+ }
+ 
+-
+-
+ #endif

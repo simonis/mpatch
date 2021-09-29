@@ -1,0 +1,424 @@
+#!/usr/bin/env python
+# This software may be used and distributed according to the terms
+# of the GNU General Public License v2, incorporated herein by reference.
+
+import sys, os, bisect, re
+from optparse import OptionParser
+from mpatch import patch, ui, diffhelpers, util, version
+from mpatch.i18n import gettext as _
+
+global_conflicts = 0
+global_rejects = 0
+
+wsre = re.compile('[ \r\t\n]+')
+
+class rejhunk:
+    def __init__(self, h, f):
+        self.hunk = h
+        self.match = []
+        self.score = 0
+        self.start = 0
+        self.conficts = 0
+        self.file = f
+        self.direction = False
+
+    def findline(self, l, min):
+        # look for line l in the file's hash.  min is the minimum line number
+        # to return
+        try:
+            res = self.file.hash[l]
+        except KeyError:
+            return None
+        i = bisect.bisect_right(res, min)
+        if i < len(res):
+            return res[i]
+        return None
+        
+    def findforward(self):
+        # search for the new text of the hunk already in the file.
+        # the file should already be hashed
+        hlines = self.hunk.newctrl()
+        orig_start = self.hunk.startb
+        if len(hlines) < 6:
+            # only guess about applied hunks when there is some context.
+            return False
+        for fuzzlen in xrange(3):
+            lines = self.hunk.fuzzit(hlines, fuzzlen, False)
+            cand = self.file.findlines(lines[0][1:], orig_start)
+            for l in cand:
+                if diffhelpers.testhunk(lines, self.file.lines, l) == 0:
+                    self.file.ui.warn(
+                             _("hunk %d already applied at line %d (fuzz %d)\n"
+                             % (self.hunk.number, l+1, fuzzlen)))
+                    return True
+        return False
+
+    def search(self):
+        # search through the file for a good place to put our hunk.
+        # on return the rejhunk is setup for a call to apply.  We will
+        # either have found a suitable location or have given up and
+        # set things up to put the hunk at the start of the file.
+        self.file.hashlines()
+        if self.findforward():
+            # this hunk was already applied
+            self.score = -2
+            return
+
+        scan = ((False, self.hunk.old(), self.hunk.starta),
+                 (True, self.hunk.newctrl(), self.hunk.startb))
+        last = (-1, -1, 0, [], None)
+        for direction, hlines, hstart in scan:
+            maxlines = min(len(hlines)/2+1, 15)
+            # don't look forward if we already have a conflict free
+            # match of the old text
+            if direction and last[1] > 3 and last[2] == 0:
+                break
+            for i in xrange(maxlines):
+                try:
+                    res = self.file.hash[hlines[i][1:]]
+                except KeyError:
+                    continue
+                for s in res:
+                    start, score, conflicts, match = self.align(s-1, i, hlines)
+                    
+                    # new text matches are more likely to have false positives.
+                    # use a higher bar for them.
+                    if direction and score < 7:
+                        score = -1
+
+                    if score > last[1]:
+                        update = True
+                        # more special checks for replacing an match of the
+                        # old text with the new.  Check for conflicts
+                        # and the size of the total match.
+                        if direction and last[4] == False:
+                            dist = len(match) - len(hlines)
+                            if conflicts and dist > ((len(hlines) * 3) / 2):
+                                update = False
+                        if update:
+                            last = (start, score, conflicts, match, direction)
+                    elif score == last[1]:
+                        distold = abs(last[0] - hstart)
+                        distnew = abs(start - hstart)
+                        if direction == False or last[4] == True:
+                            # we prefer to match the old text, so if
+                            # we don't replace a match of the old text
+                            # with a match of the new
+                            if distnew < distold:
+                                last = (start, score, conflicts, match,
+                                        direction)
+        if last[1] > 3:
+            (self.start, self.score, self.conflicts,
+             self.match, self.direction) = last
+        else:
+            # no good locations found, lets just put it at the start of the
+            # file.
+            self.conflicts = 1
+            
+    def scoreline(self, l):
+        ws = wsre.sub('', l)
+        if len(ws) == 0:
+            return .25
+        return 1
+
+    def apply(self):
+        # after calling search, call apply to merge the hunk into the file.
+        # on return the file is dirtied but not written
+        if self.direction:
+            # when merging into already applied data, the match array
+            # has it all
+            new = []
+        else:
+            new = self.hunk.newctrl()
+        newi = 0
+        filei = self.start
+        lines = []
+        i = 0
+        while i < len(self.match) or newi < len(new):
+            # the order is a little strange.
+            # ctrl of '|' means the file had lines the hunk did not.  These
+            # need to go before any '+' lines from the new hunk
+            if i < len(self.match):
+                l = self.match[i]
+                ctrl = l[0]
+                if ctrl == '|':
+                    lines.append(l[1:])
+                    filei += 1
+                    i += 1
+                    continue
+
+            # find lines added by the hunk
+            if newi < len(new):
+                l = new[newi]
+                if l[0] == '+':
+                    lines.append(l[1:])
+                    newi += 1
+                    continue
+                elif i >= len(self.match):
+                    # if we've gone through the whole match array,
+                    # the new hunk may have context that didn't exist
+                    # in the file.  Just skip past it.
+                    newi += 1
+                    continue
+
+            l = self.match[i]
+            i += 1
+            ctrl = l[0]
+            if ctrl == '-':
+                # deleted by the hunk, skip over it in the file
+                filei += 1
+                pass
+            elif ctrl == '^':
+                # in the hunk but missing from the file.  skip over it in
+                # the hunk
+                newi += 1
+            elif ctrl == '<':
+                # deleted by the hunk but missing from the file.  Let the
+                # user know by inserting the deletion marker
+                lines.append(l)
+            elif ctrl == '+':
+                # only happens when self.direction == True
+                lines.append(l[1:])
+                continue
+            elif ctrl == ' ':
+                # context from the hunk found in the file.  Add it
+                lines.append(l[1:])
+                newi += 1
+                filei += 1
+            else:
+                raise patch.PatchError("unknown control char %s" % l)
+
+        self.file.lines[self.start:filei] = lines
+        self.file.dirty = 1
+
+    def align(self, fstart, hstart, hlines):
+        hcur = hstart
+        fcur = fstart
+        flines = self.file.lines
+        retstart = None
+        match = []
+        score = 0
+        conflicts = 0
+
+        # add deletion markers for any lines removed by the parts of the
+        # hunk we could not find (between 0 and hstart)
+        for i in xrange(hstart):
+            if hlines[i][0] == '-':
+                match.append('<<<<del ' + hlines[i][1:])
+            elif hlines[i][0] == '+':
+                match.append(hlines[i])
+        consec = False
+        last_append = None
+        while hcur < len(hlines):
+            if hcur > len(hlines)/2 and score <= 0:
+                return (-1, -1, 1, [])
+            fnext = self.findline(hlines[hcur][1:], fcur)
+            ctrl = hlines[hcur][0]
+            if fnext == None or (fcur >=0 and fnext - fcur > 20):
+                consec = False
+                fnext = None
+                if ctrl == '-':
+                    # we've failed to find a line the patch wanted to delete.
+                    # record it as a conflict.
+                    match.append('<<<<del ' + hlines[hcur][1:])
+                    conflicts += 1
+                elif ctrl == '+':
+                    match.append(hlines[hcur])
+                    conflicts += 1
+                else:
+                    match.append('^' + hlines[hcur][1:])
+            else:
+                if fcur >= 0 and retstart:
+                    # any lines between fcur and fnext were in the file but
+                    # not the hunk.
+                    # decrement our score for a big block of missing lines
+                    dist = fnext - fcur
+                    while dist > 5:
+                        score -= 1
+                        dist -= 5
+                    for x in xrange(fcur+1, fnext):
+                        match.append('|' + flines[x])
+                if retstart == None:
+                    retstart = fnext
+                # plus one just for finding a match
+                # plus one more if it was a consecutive match
+                # plus one more if it was a match on a line we're deleting
+                # or adding.  But, only do it for non-ws lines and for
+                # lines relatlively close to the last match
+                inc = self.scoreline(hlines[hcur][1:])
+                score += inc
+                if consec and fnext == fcur + 1:
+                    score += inc
+                if ctrl == '-' or ctrl == '+':
+                    ws = hlines[hcur].rstrip()
+                    if len(ws) > 1 and fnext - fcur < 5:
+                        score += inc
+                consec = True
+                # record the line from the hunk we did find
+                if ctrl == '+':
+                    # we matched a line added by the hunk.  The code that
+                    # merges needs to know to inc the file line number to
+                    # include this line, so instead of adding a + ctrl
+                    # use |
+                    match.append('|' + hlines[hcur][1:])
+                else:
+                    match.append(hlines[hcur])
+
+            hcur += 1
+            if fnext != None:
+                fcur = fnext
+        return (retstart, score, conflicts, match)
+
+def rejmerge(options):
+    def inner(patchfile):
+        def backup(orig):
+            if options.dry_run:
+                return None
+            fname = orig + ".mergebackup"
+            try: os.unlink(fname)
+            except: pass
+            old = file(orig)
+            new = file(fname, 'w')
+            for x in old:
+                new.write(x)
+            return fname
+
+        rej = patchfile.rej
+        if not rej:
+            return
+        if not options.auto and not options.output:
+            return
+        backupf =None
+        badrej = []
+        for h in rej:
+            r = rejhunk(h, patchfile)
+            r.search()
+            if r.score >= 0:
+                if not backupf:
+                    backupf = backup(patchfile.fname)
+                if not options.dry_run:
+                    global global_conflicts
+                    global global_rejects
+                    if r.direction:
+                        s = "warning file %s hunk %d: merging " % (
+                             patchfile.fname, h.number)
+                        patchfile.ui.warn(s + "with changes already applied\n")
+                    r.apply()
+                    if r.conflicts > 0:
+                        global_conflicts += 1
+                    global_rejects += 1
+        patchfile.rej = badrej
+        if backupf or options.output:
+            dest = None
+            if options.output:
+                dest = options.output
+                patchfile.dirty = 1
+            else:
+                dest = patchfile.fname
+            patchfile.write(dest=dest)
+            if not options.no_merge and (not options.output or options.auto):
+                prog = options.merge
+                if 'gvimdiff' in prog:
+                    os.system("%s -f %s %s" % (prog, dest, backupf))
+                elif 'kdiff3' in prog:
+                    os.system("%s -o %s %s %s" % (prog, dest, dest, backupf))
+                else:
+                    ttyin = ""
+                    if not sys.stdin.isatty():
+                        sys.stderr.write("Using /dev/tty for stdin\n")
+                        ttyin = " < /dev/tty"
+                    os.system("%s %s %s %s" % (prog, dest, backupf, ttyin))
+            if options.no_backup:
+                try: os.unlink(backupf)
+                except: pass
+    return inner
+
+def updatedir(patches):
+    l = patches.keys()
+    l.sort()
+    for f in l:
+        ctype, gp = patches[f]
+        if gp.mode != None:
+            x = gp.mode & 0100 != 0
+            util.set_exec(gp.path, x)
+            
+usage = "mpatch version %s\n" % version.version + \
+        "usage: %prog [options] file [reject]"
+parser = OptionParser(usage=usage)
+parser.add_option("-a", "--auto", help="auto merge", action="store_true",
+                  default=False)
+parser.add_option("-d", "--dir", help="change to this dir", default="")
+parser.add_option("-o", "--output", help="merge output file", default="")
+parser.add_option("-m", "--merge", help="merge program", default="gvimdiff")
+parser.add_option("-M", "--no-merge", help="skip the merge program",
+                  default=False, action="store_true")
+parser.add_option("-N", "--no-backup", help="don't create a backup on merge",
+                  default=False, action="store_true")
+parser.add_option("", "--lsprof", help="profile with lsprof",
+                  default=False, action="store_true")
+parser.add_option("-p", "--strip", help="strip level", default=1)
+parser.add_option("-R", "--reverse", help="reverse the patch", default=False,
+                  action="store_true")
+parser.add_option("-v", "--verbose", action="store_true", help="verbose",
+                                default=False)
+(options, args) = parser.parse_args()
+
+# disable dry_run for now
+options.dry_run = False
+
+ui = ui.ui(verbose=options.verbose)
+
+if options.dir:
+    try:
+        os.chdir(options.dir)
+    except:
+        ui.warn("Unable to change directories to %s" % options.dir)
+        sys.exit(1)
+if len(args) == 2:
+    sourcefile = args[0]
+    rejfile = args[1]
+elif len(args) == 1:
+    s = args[0]
+    if s.endswith('.rej'):
+        rejfile = s
+        sourcefile = s.rstrip('.rej')
+    else:
+        sourcefile = s
+        rejfile = s + '.rej'
+    if not os.path.exists(rejfile) and os.path.exists(sourcefile):
+        rejfile = sourcefile
+        sourcefile = None
+else:
+    sourcefile = None
+    rejfile = None
+
+if rejfile:
+    diffp = file(rejfile)
+else:
+    diffp = sys.stdin
+
+changed = {}
+try:
+
+    if options.lsprof:
+        from mpatch import lsprof
+        p = lsprof.Profiler()
+        p.enable(subcalls=True)
+    ret = patch.applydiff(ui, diffp, changed, strip=int(options.strip),
+                          sourcefile=sourcefile, rejmerge=rejmerge(options),
+                          updatedir=updatedir,
+                          reverse=options.reverse)
+    if options.lsprof:
+        p.disable()
+        stats = lsprof.Stats(p.getstats())
+        stats.sort()
+        stats.pprint(top=10, file=sys.stderr, climit=5)
+
+except patch.PatchError, inst:
+    sys.stderr.write("Error: %s\n" % inst)
+    if options.verbose:
+        raise
+    sys.exit(1)
+if ret == 0 and global_conflicts:
+    ret = 1
+sys.exit(ret)

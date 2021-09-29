@@ -1,0 +1,11 @@
+mpatch requires python and the python distutils to install.
+
+To install in the default locations (/usr or /usr/local usually):
+$ python setup.py install --force
+
+To install in your home directory (~/bin and ~/lib, actually), run:
+
+$ python setup.py install --home=${HOME} --force
+$ export PYTHONPATH=${HOME}/lib/python  # (or lib64/ on some systems)
+$ export PATH=${HOME}/bin:$PATH         # add these to your .bashrc
+

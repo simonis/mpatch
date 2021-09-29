@@ -1,0 +1,25 @@
+--- test
++++ test
+@@ -961,11 +963,10 @@ struct dentry * __d_lookup(struct dentry
+ 
+ 	rcu_read_lock();
+ 	
+-	hlist_for_each (node, head) {
++	hlist_for_each_rcu(node, head) {
+ 		struct dentry *dentry; 
+ 		struct qstr *qstr;
+ 
+-		smp_read_barrier_depends();
+ 		dentry = hlist_entry(node, struct dentry, d_hash);
+ 
+ 		smp_rmb();
+@@ -992,8 +993,7 @@ struct dentry * __d_lookup(struct dentry
+ 		if (dentry->d_parent != parent)
+ 			goto next;
+ 
+-		qstr = &dentry->d_name;
+-		smp_read_barrier_depends();
++		qstr = rcu_dereference(&dentry->d_name);
+ 		if (parent->d_op && parent->d_op->d_compare) {
+ 			if (parent->d_op->d_compare(parent, qstr, name))
+ 				goto next;

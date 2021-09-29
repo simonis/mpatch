@@ -1,0 +1,17 @@
+# test changing lines with different context at the start and end
+# and less context in the middle
+A
+B
+C
+AA
+BB
+CC different context
+DDD
+EE
+GGG
+HH different context
+HHH new line
+II
+E
+F
+G

@@ -1,0 +1,256 @@
+#!/usr/bin/perl
+#
+# usage: qp [-a] [-f] [-i] [-d] [patch]
+# -a means to push all the patches
+# -f means to use quilt push -f
+# if a patch is supplied, qp stops after applying one patch
+#
+# The basic idea is to look for fuzz and rejects while applying patches
+# and prompt you on the action to take.  Actions include opening the file
+# or patch, as well as running mpatch for rejects.
+#
+# Example prompt:
+#
+# action: edit [f]ile [p]atch, [n]ext: [fpN]: 
+#
+# Choices in caps are default, so if you hit enter here, you'll skip to
+# the next fuzz.  If no choice is in caps, there is no default, you'll be
+# prompted until you hit a valid key
+#
+# released under GPL v2
+use strict;
+use POSIX ":sys_wait_h";
+
+my $VERSION = "0.5";
+
+my $EDITOR=$ENV{'QP_EDITOR'};
+if (!defined($EDITOR)) {
+    $EDITOR="gvim";
+}
+
+my $ret;
+my $quilt_args = "";
+my @fuzz_results = ();
+my @rej_results = ();
+my $current_file;
+my $current_patch;
+my $force = 0;
+my $force_once = 0;
+my $last_patch = "";
+my $use_force = "";
+my $push_all = 0;
+my $mergerej_pid = 0;
+my $quilt_series_done = 0;
+my $ignorefuzz = 0;
+
+sub run_mergerej($$) {
+    my ($file, $auto) = @_;
+    my $pid;
+    if (mergerej_running()) {
+        print STDERR "mpatch already running, pid $mergerej_pid\n";
+	return;
+    }
+    $pid = fork();
+    if ($pid) {
+        $mergerej_pid = $pid;
+	print "rej started:\n";
+	return;
+    }
+    exec("mpatch $auto $file");
+}
+sub mergerej_running() {
+    my $ret;
+    if ($mergerej_pid) {
+	$ret = waitpid($mergerej_pid, WNOHANG);
+	if ($ret == 0) {
+	    return 1;
+	} 
+	$mergerej_pid = 0;
+    }
+    return 0;
+}
+sub run_quilt() {
+    if ($force_once || $force) {
+	$use_force = "-f";
+    } else {
+	$use_force = "";
+    }
+    $force_once = 0;
+    if (scalar(@rej_results) || scalar(@fuzz_results)) {
+    	die("ERROR fuzz or reject results not empty\n");
+    }
+    $ret = open(QUILT, "quilt push $use_force|");
+    if (!defined($ret)) {
+        $ret = $? >> 8;
+	die("err $ret from quilt\n");
+    }
+    while(<QUILT>) {
+	chomp;
+	if (m/^Applying(\s+patch)?\s+(.*)/) {
+	    $current_patch = $2;
+	} elsif (m/^patching file (.*)/) {
+	    $current_file = $1;
+	} elsif (m/^Hunk.*with fuzz/) {
+	    my @words = split;
+	    my $hunk = $words[1];
+	    $hunk =~ s/^#//;
+	    my $line = $words[4];
+	    my $fuzz = $words[7];
+	    my @ar = ($current_patch, $current_file, $hunk, $fuzz, $line);
+	    push @fuzz_results, \@ar;
+	} elsif (m/^Hunk.*FAILED/) {
+	    my @words = split;
+	    my $hunk = $words[1];
+	    $hunk =~ s/^#//;
+	    my $line = 4;
+	    my @ar = ($current_patch, $current_file, $hunk, $line);
+	    push @rej_results, \@ar;
+	} elsif (m/^File series fully applied/) {
+	    $quilt_series_done = 1;
+	}
+	print ("$_\n");
+    }
+    close(QUILT);
+    return $? >> 8;
+}
+
+sub process_results($) {
+    my ($ret) = @_;
+    if ($quilt_series_done) {
+        exit(0);
+    }
+    if ($ignorefuzz) {
+        @fuzz_results = ();
+    }        
+    if ($ret || scalar(@fuzz_results) || scalar(@rej_results)) 
+    {
+	print "quilt returned $ret, with " . scalar(@fuzz_results) . " fuzz and " . scalar(@rej_results) . " rejects\n";
+	if (scalar(@rej_results) && $use_force eq "") {
+	    while(1) {
+		print "use quilt -f? y/n [y]: ";
+		my $q = <STDIN>;
+		chomp($q);
+		if ($q eq "y" || $q eq "yes") {
+		    $force_once = 1;
+		    @fuzz_results = ();
+		    @rej_results = ();
+		    run_quilt();
+		    last;
+		}
+		last if ($q eq "n" || $q eq "no");
+	    }
+	}
+	# process the fuzz results first.
+	my $num = scalar(@fuzz_results);
+	my $i = 0;
+	for ($i = 0 ; $i < $num ; $i++) {
+	    my $f = $fuzz_results[$i];
+	    my $next = $fuzz_results[$i +1];
+	    print "fuzz patch $$f[0] file $$f[1] hunk $$f[2] fuzz $$f[3] line $$f[4]\n";
+	    next if (defined($next) && $$next[1] eq $$f[1]);
+	    while(1) {
+		print "action: edit [f]ile [p]atch, [n]ext, [b]oth: [fpbN]: ";
+		my $q = <STDIN>;
+		chomp($q);
+		if ($q eq "f" || $q eq "b") {
+		    my $lineopt = "";
+		    if ($EDITOR =~ m/vi/) {
+		        $lineopt = "+$$f[4]";
+		    }
+		    system("$EDITOR $$f[1] $lineopt");
+		}
+		if ($q eq "p" || $q eq "b") {
+		    system("$EDITOR patches/$$f[0]");
+		} elsif ($q eq "n" || $q eq "") {
+		    last;
+		}
+	    }
+	}
+
+	# now process all the rejects
+	#
+	$num = scalar(@rej_results);
+	$i = 0;
+	for ($i = 0 ; $i < $num ; $i++) {
+	    my $f = $rej_results[$i];
+	    my $next = $rej_results[$i +1];
+	    print "reject patch $$f[0] file $$f[1] hunk $$f[2] line $$f[3]\n";
+	    next if (defined($next) && $$next[1] eq $$f[1]);
+	    while(1) {
+		print "[a]uto[m]erge,edit [f]ile [p]atch [r]ej,[n]ext,[d]elete: [amfdprn]: ";
+		my $q = <STDIN>;
+		chomp($q);
+		if ($q eq "f") {
+		    system("$EDITOR $$f[1]");
+		} elsif ($q eq "p") {
+		    system("$EDITOR patches/$$f[0]");
+		} elsif ($q eq "r") {
+		    system("$EDITOR $$f[1].rej");
+		} elsif ($q eq "a") {
+		    run_mergerej("$$f[1].rej", "-a" );
+		} elsif ($q eq "m") {
+		    run_mergerej("$$f[1].rej", "");
+		} elsif ($q eq "d") {
+		    $ret = unlink "$$f[1].rej";
+		    if (!$ret) {
+			print STDERR "unable to unlink $$f[1].rej";
+		    }
+		    last;
+		} elsif ($q eq "n") {
+		    last;
+		}
+	    }
+	    # make sure mergerej is done
+	    if ($mergerej_pid) {
+		waitpid $mergerej_pid, 0;
+	    }
+	}
+	@fuzz_results = ();
+	@rej_results = ();
+	while(1) {
+	    print "$current_patch done [s]top, [n]ext, [r]efresh [snr]: ";
+	    my $q = <STDIN>;
+	    chomp $q;
+	    if ($q eq "s") {
+		exit(1);
+	    } elsif ($q eq "n") {
+		last;
+	    } elsif ($q eq "r") {
+		$ret = system("quilt refresh");
+		if (!defined($ret) || $ret) {
+		    print STDERR "error on quilt refresh\n";
+		} else {
+		    last;
+		}
+	    }
+	}
+    }
+}
+
+foreach my $s (@ARGV) {
+    if ($s =~ m/^-f/) {
+    	$force = 1;
+    } elsif ($s =~ m/^-a/) {
+        $push_all = 1;
+    } elsif ($s =~ m/^-i/) {
+        $ignorefuzz = 1;
+    } elsif ($s =~ m/^-/) {
+        print STDERR "usage: qp [-fi] [patch file]\n";
+	print STDERR "\t-f force\n";
+	print STDERR "\t-i ignore fuzz\n";
+	exit(1);
+    } else {
+	$s =~ s/^patches\///;
+    	$last_patch = $s;
+	$push_all = 1;
+	print STDERR "stopping at $s\n";
+    }
+}
+
+while(1) {
+    $ret = run_quilt();
+    process_results($ret);
+    if (!$push_all || $current_patch eq $last_patch) {
+	exit(0);
+    }
+}
