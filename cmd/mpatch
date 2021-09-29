@@ -334,10 +334,7 @@ def rejmerge(options):
     return inner
 
 def updatedir(patches):
-    l = patches.keys()
-    l.sort()
-    for f in l:
-        ctype, gp = patches[f]
+    for gp in patches:
         if gp.mode != None:
             x = gp.mode & 0100 != 0
             util.set_exec(gp.path, x)

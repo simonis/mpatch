@@ -598,9 +598,9 @@ class binhunk:
 
 def parsefilename(str, git=False):
     # --- filename \t|space stuff
+    s = str[4:]
     if git:
         return s
-    s = str[4:]
     i = s.find('\t')
     if i < 0:
         i = s.find(' ')
